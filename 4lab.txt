@@ -1,0 +1,197 @@
+
+#include <stdint.h>
+
+#define R(a) (*(volatile uint32_t *)(a))
+
+#define RCC_AHBENR  R(0x40021014U)
+#define RCC_APB1ENR R(0x4002101CU)
+
+#define GPIOA_MODER R(0x48000000U)
+#define GPIOA_AFRL  R(0x48000020U)
+#define GPIOB_MODER R(0x48000400U)
+#define GPIOB_OTYPER R(0x48000404U)
+#define GPIOB_PUPDR R(0x4800040CU)
+#define GPIOB_AFRL  R(0x48000420U)
+#define GPIOE_MODER R(0x48001000U)
+#define GPIOE_BSRR  R(0x48001018U)
+
+#define I2C_CR1     R(0x40005400U)
+#define I2C_CR2     R(0x40005404U)
+#define I2C_TIMING  R(0x40005410U)
+#define I2C_ISR     R(0x40005418U)
+#define I2C_ICR     R(0x4000541CU)
+#define I2C_RXDR    R(0x40005424U)
+#define I2C_TXDR    R(0x40005428U)
+
+#define UART_CR1    R(0x40004400U)
+#define UART_BRR    R(0x4000440CU)
+#define UART_ISR    R(0x4000441CU)
+#define UART_TDR    R(0x40004428U)
+
+#define ACC_ADDR 0x19U
+
+volatile int16_t ax, ay, az;
+volatile uint32_t status = 0, samples = 0;
+volatile uint32_t uart_bytes_sent = 0;
+volatile uint8_t accel_id = 0;
+
+static int i2c_wait(uint32_t flag)
+{
+    for (uint32_t i = 0; i < 200000U; i++) {
+        uint32_t s = I2C_ISR;
+        if (s & ((1U << 4) | (1U << 8) | (1U << 9))) return 0;
+        if (s & flag) return 1;
+    }
+    return 0;
+}
+
+static int i2c_write(uint8_t reg, uint8_t value)
+{
+    I2C_CR2 = (ACC_ADDR << 1) | (2U << 16)
+            | (1U << 25) | (1U << 13);
+
+    if (!i2c_wait(1U << 1)) return 0;
+    I2C_TXDR = reg;
+
+    if (!i2c_wait(1U << 1)) return 0;
+    I2C_TXDR = value;
+
+    if (!i2c_wait(1U << 5)) return 0;
+    I2C_ICR = 1U << 5;
+    return 1;
+}
+
+static int i2c_read(uint8_t reg, uint8_t *data, uint8_t n)
+{
+    I2C_CR2 = (ACC_ADDR << 1) | (1U << 16) | (1U << 13);
+
+    if (!i2c_wait(1U << 1)) return 0;
+    I2C_TXDR = reg;
+    if (!i2c_wait(1U << 6)) return 0;
+
+    I2C_CR2 = (ACC_ADDR << 1) | ((uint32_t)n << 16)
+            | (1U << 10) | (1U << 25) | (1U << 13);
+
+    for (uint8_t i = 0; i < n; i++) {
+        if (!i2c_wait(1U << 2)) return 0;
+        data[i] = (uint8_t)I2C_RXDR;
+    }
+
+    if (!i2c_wait(1U << 5)) return 0;
+    I2C_ICR = 1U << 5;
+    return 1;
+}
+
+static void uart_char(char c)
+{
+    while (!(UART_ISR & (1U << 7))) {}
+    UART_TDR = (uint8_t)c;
+    uart_bytes_sent++;
+}
+
+static void uart_text(const char *s)
+{
+    while (*s) uart_char(*s++);
+}
+
+static void uart_number(int n)
+{
+    char digits[6];
+    int i = 0;
+
+    if (n < 0) {
+        uart_char('-');
+        n = -n;
+    }
+
+    do {
+        digits[i++] = '0' + n % 10;
+        n /= 10;
+    } while (n);
+
+    while (i) uart_char(digits[--i]);
+}
+
+int main(void)
+{
+    uint8_t data[6], id;
+
+    RCC_AHBENR |= (1U << 17) | (1U << 18) | (1U << 21);
+    RCC_APB1ENR |= (1U << 17) | (1U << 21);
+    (void)RCC_AHBENR;
+
+    GPIOB_MODER = (GPIOB_MODER & ~((3U << 12) | (3U << 14)))
+                | (2U << 12) | (2U << 14);
+    GPIOB_OTYPER |= (1U << 6) | (1U << 7);
+    GPIOB_PUPDR = (GPIOB_PUPDR & ~((3U << 12) | (3U << 14)))
+                | (1U << 12) | (1U << 14);
+    GPIOB_AFRL = (GPIOB_AFRL & ~((15U << 24) | (15U << 28)))
+               | (4U << 24) | (4U << 28);
+
+    GPIOA_MODER = (GPIOA_MODER & ~(3U << 4)) | (2U << 4);
+    GPIOA_AFRL = (GPIOA_AFRL & ~(15U << 8)) | (7U << 8);
+
+    GPIOE_MODER = (GPIOE_MODER & ~(3U << 18)) | (1U << 18);
+    GPIOE_BSRR = 1U << 25;
+
+    I2C_CR1 = 0;
+    I2C_TIMING = 0x10421317U;
+    I2C_ICR = (1U << 4) | (1U << 5) | (1U << 8) | (1U << 9);
+    I2C_CR1 = 1;
+
+    UART_CR1 = 0;
+
+    UART_BRR = 69;
+    //speed 9600
+
+    UART_CR1 = (1U << 3) | 1U;
+
+    if (!i2c_read(0x0F, &id, 1)) {
+        status = 2;
+        goto error;
+    }
+
+    accel_id = id;
+    if (id != 0x33) {
+        status = 3;
+        goto error;
+    }
+
+    if (!i2c_write(0x20, 0x57) ||
+        !i2c_write(0x23, 0x08)) {
+        status = 4;
+        goto error;
+    }
+
+    uart_text("STM32 Accelerometer Ready\r\n");
+
+    while (1)
+    {
+        if (!i2c_read(0xA8, data, 6)) {
+            status = 5;
+            goto error;
+        }
+
+        ax = (int16_t)(data[0] | (data[1] << 8)) / 16;
+        ay = (int16_t)(data[2] | (data[3] << 8)) / 16;
+        az = (int16_t)(data[4] | (data[5] << 8)) / 16;
+
+        status = 1;
+        samples++;
+        GPIOE_BSRR = 1U << 9;
+
+        uart_text("X=");
+        uart_number(ax);
+        uart_text(" Y=");
+        uart_number(ay);
+        uart_text(" Z=");
+        uart_number(az);
+        uart_text("\r\n");
+
+        for (volatile uint32_t i = 0; i < 500000; i++) {}
+    }
+
+error:
+    GPIOE_BSRR = 1U << 25;
+    while (1) {}
+}
